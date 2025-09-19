@@ -373,3 +373,137 @@
 
     ;; Return tokens to user
     (try! (as-contract (stx-transfer? amount tx-sender tx-sender)))
+
+    ;; Update stake record
+    (map-set users tx-sender
+      (merge user-data {
+        stake-amount: (- current-stake amount),
+        last-action-block: stacks-block-height,
+      })
+    )
+    (ok amount)
+  )
+)
+
+;; CONTENT CREATION & PUBLISHING
+
+;; Publish new content with stake backing
+(define-public (create-content
+    (content-hash (string-ascii 64))
+    (title (string-utf8 100))
+    (category (string-ascii 20))
+    (stake-backing uint)
+  )
+  (let (
+      (user-data (unwrap! (map-get? users tx-sender) err-not-found))
+      (content-id (+ (var-get content-id-nonce) u1))
+      (user-stake (get stake-amount user-data))
+    )
+    ;; Validation checks
+    (asserts! (var-get contract-enabled) err-unauthorized)
+    (asserts! (> (get stake-amount user-data) u0) err-stake-required)
+    (asserts! (>= user-stake stake-backing) err-insufficient-funds)
+    (asserts! (validate-amount stake-backing) err-invalid-input)
+    (asserts! (validate-content-hash content-hash) err-invalid-input)
+    (asserts! (validate-title title) err-invalid-input)
+    (asserts! (validate-category category) err-invalid-input)
+
+    ;; Create content record
+    (var-set content-id-nonce content-id)
+    (map-set content content-id {
+      creator: tx-sender,
+      content-hash: content-hash,
+      title: title,
+      category: category,
+      timestamp: stacks-block-height,
+      total-votes: u0,
+      positive-votes: u0,
+      quality-score: u0,
+      reward-claimed: false,
+      stake-backing: stake-backing,
+    })
+
+    ;; Update user profile
+    (map-set users tx-sender
+      (merge user-data {
+        total-content: (+ (get total-content user-data) u1),
+        stake-amount: (- user-stake stake-backing),
+        last-action-block: stacks-block-height,
+      })
+    )
+
+    ;; Award creation reputation bonus
+    (unwrap! (update-reputation tx-sender 10 "content-creation") err-owner-only)
+    (ok content-id)
+  )
+)
+
+;; VOTING & CURATION SYSTEM
+
+;; Cast weighted vote on content quality
+(define-public (vote-content (content-id uint) (vote-positive bool))
+  (let (
+      (content-data (unwrap! (map-get? content content-id) err-not-found))
+      (voter-data (unwrap! (map-get? users tx-sender) err-not-found))
+      (creator (get creator content-data))
+      (existing-vote (map-get? votes {
+        content-id: content-id,
+        voter: tx-sender,
+      }))
+      (voting-weight (calculate-voting-weight tx-sender))
+      (current-total (get total-votes content-data))
+      (current-positive (get positive-votes content-data))
+    )
+    ;; Validation checks
+    (asserts! (var-get contract-enabled) err-unauthorized)
+    (asserts! (not (is-eq tx-sender creator)) err-self-interaction)
+    (asserts! (is-none existing-vote) err-already-voted)
+    (asserts! (> (get stake-amount voter-data) u0) err-stake-required)
+    (asserts! (validate-content-id content-id) err-invalid-input)
+
+    ;; Record vote with timestamp
+    (map-set votes {
+      content-id: content-id,
+      voter: tx-sender,
+    } {
+      vote-type: vote-positive,
+      stake-weight: voting-weight,
+      timestamp: stacks-block-height,
+    })
+
+    ;; Update content metrics
+    (let (
+        (new-total (+ current-total voting-weight))
+        (new-positive (if vote-positive
+          (+ current-positive voting-weight)
+          current-positive
+        ))
+        (new-quality-score (if (> new-total u0)
+          (/ (* new-positive u1000) new-total)
+          u0
+        ))
+      )
+      (map-set content content-id
+        (merge content-data {
+          total-votes: new-total,
+          positive-votes: new-positive,
+          quality-score: new-quality-score,
+        })
+      )
+
+      ;; Update creator reputation based on vote outcome
+      (let ((reputation-change (if vote-positive
+          (to-int voting-weight)
+          (- 0 (to-int voting-weight))
+        )))
+        (unwrap! (update-reputation creator reputation-change "vote-received")
+          err-owner-only
+        )
+      )
+
+      ;; Reward voter participation
+      (unwrap! (update-reputation tx-sender 1 "vote-participation") err-owner-only)
+      (ok voting-weight)
+    )
+  )
+)
