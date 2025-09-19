@@ -186,3 +186,190 @@
     })
   )
 )
+
+;; Calculate content quality score based on voting patterns
+(define-read-only (calculate-content-quality (content-id uint))
+  (let (
+      (content-data (unwrap! (map-get? content content-id) u0))
+      (total-votes (get total-votes content-data))
+      (positive-votes (get positive-votes content-data))
+    )
+    (if (> total-votes u0)
+      (/ (* positive-votes u1000) total-votes) ;; Quality score out of 1000
+      u0
+    )
+  )
+)
+
+;; Compute comprehensive trust score combining multiple factors
+(define-read-only (calculate-trust-score (user principal))
+  (let (
+      (user-data (unwrap! (map-get? users user) u0))
+      (reputation (get reputation-score user-data))
+      (stake-amount (get stake-amount user-data))
+      (content-count (get total-content user-data))
+    )
+    (+ 
+      (/ reputation u10) ;; Reputation component
+      (/ stake-amount u100000) ;; Stake component
+      (* content-count u5) ;; Content activity bonus
+    )
+  )
+)
+
+;; INTERNAL UTILITY FUNCTIONS
+
+;; Update user reputation with historical tracking
+(define-private (update-reputation
+    (user principal)
+    (score-change int)
+    (reason (string-ascii 50))
+  )
+  (let (
+      (current-user (default-to {
+        reputation-score: u0,
+        total-content: u0,
+        total-earnings: u0,
+        stake-amount: u0,
+        last-action-block: u0,
+        verified: false,
+        join-block: stacks-block-height,
+      }
+        (map-get? users user)
+      ))
+      (current-score (get reputation-score current-user))
+      (new-score (if (< score-change 0)
+        (if (>= current-score (to-uint (- 0 score-change)))
+          (- current-score (to-uint (- 0 score-change)))
+          u0
+        )
+        (+ current-score (to-uint score-change))
+      ))
+    )
+    ;; Update user profile
+    (map-set users user
+      (merge current-user {
+        reputation-score: new-score,
+        last-action-block: stacks-block-height,
+      })
+    )
+    ;; Record reputation change history
+    (map-set reputation-history {
+      user: user,
+      block: stacks-block-height,
+    } {
+      old-score: current-score,
+      new-score: new-score,
+      reason: reason,
+    })
+    (ok new-score)
+  )
+)
+
+;; Calculate voting influence based on reputation and stake
+(define-private (calculate-voting-weight (voter principal))
+  (let (
+      (user-data (unwrap! (map-get? users voter) u1))
+      (reputation (get reputation-score user-data))
+      (stake-amount (get stake-amount user-data))
+    )
+    (+ 
+      u1 ;; Base voting weight
+      (/ reputation u100) ;; Reputation bonus
+      (/ stake-amount u1000000) ;; Stake bonus
+    )
+  )
+)
+
+;; Distribute rewards to content creators based on quality metrics
+(define-private (distribute-content-rewards (content-id uint))
+  (let (
+      (content-data (unwrap! (map-get? content content-id) err-not-found))
+      (creator (get creator content-data))
+      (quality-score (get quality-score content-data))
+      (total-votes (get total-votes content-data))
+      (reward-amount (/ (* quality-score (var-get content-reward-pool)) u10000))
+    )
+    (if (and (> reward-amount u0) (not (get reward-claimed content-data)))
+      (begin
+        ;; Transfer rewards to creator
+        (unwrap! (as-contract (stx-transfer? reward-amount tx-sender creator))
+          err-insufficient-funds
+        )
+        ;; Mark rewards as claimed
+        (map-set content content-id (merge content-data { reward-claimed: true }))
+        ;; Update reward pool
+        (var-set content-reward-pool
+          (- (var-get content-reward-pool) reward-amount)
+        )
+        ;; Boost creator reputation
+        (unwrap!
+          (update-reputation creator (to-int (/ quality-score u10)) "content-reward")
+          err-owner-only
+        )
+        (ok reward-amount)
+      )
+      (ok u0)
+    )
+  )
+)
+
+;; USER ONBOARDING & ACCOUNT MANAGEMENT
+
+;; Register new user in the ecosystem
+(define-public (register-user)
+  (let ((existing-user (map-get? users tx-sender)))
+    (asserts! (is-none existing-user) err-already-exists)
+    (map-set users tx-sender {
+      reputation-score: u100, ;; Starting reputation
+      total-content: u0,
+      total-earnings: u0,
+      stake-amount: u0,
+      last-action-block: stacks-block-height,
+      verified: false,
+      join-block: stacks-block-height,
+    })
+    (ok true)
+  )
+)
+
+;; Stake STX tokens to increase platform influence
+(define-public (stake-tokens (amount uint))
+  (let (
+      (user-data (unwrap! (map-get? users tx-sender) err-not-found))
+      (current-stake (get stake-amount user-data))
+    )
+    (asserts! (validate-amount amount) err-invalid-input)
+    (asserts! (>= amount (var-get min-stake-amount)) err-invalid-amount)
+
+    ;; Transfer tokens to contract
+    (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+
+    ;; Update user stake
+    (map-set users tx-sender
+      (merge user-data {
+        stake-amount: (+ current-stake amount),
+        last-action-block: stacks-block-height,
+      })
+    )
+
+    ;; Reward reputation for staking
+    (unwrap!
+      (update-reputation tx-sender (to-int (/ amount u100000)) "stake-increase")
+      err-owner-only
+    )
+    (ok amount)
+  )
+)
+
+;; Withdraw staked tokens from the protocol
+(define-public (unstake-tokens (amount uint))
+  (let (
+      (user-data (unwrap! (map-get? users tx-sender) err-not-found))
+      (current-stake (get stake-amount user-data))
+    )
+    (asserts! (validate-amount amount) err-invalid-input)
+    (asserts! (>= current-stake amount) err-insufficient-funds)
+
+    ;; Return tokens to user
+    (try! (as-contract (stx-transfer? amount tx-sender tx-sender)))
