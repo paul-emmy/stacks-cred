@@ -507,3 +507,102 @@
     )
   )
 )
+
+;; SOCIAL GRAPH FUNCTIONS
+
+;; Follow another user to build social connections
+(define-public (follow-user (user-to-follow principal))
+  (begin
+    (asserts! (not (is-eq tx-sender user-to-follow)) err-self-interaction)
+    (asserts! (validate-user user-to-follow) err-not-found)
+    (asserts! (is-some (map-get? users tx-sender)) err-not-found)
+
+    (map-set user-following {
+      follower: tx-sender,
+      following: user-to-follow,
+    } true)
+
+    ;; Boost followee reputation
+    (unwrap! (update-reputation user-to-follow 5 "new-follower") err-owner-only)
+    (ok true)
+  )
+)
+
+;; Unfollow a user
+(define-public (unfollow-user (user-to-unfollow principal))
+  (begin
+    (asserts! (not (is-eq tx-sender user-to-unfollow)) err-self-interaction)
+    (map-delete user-following {
+      follower: tx-sender,
+      following: user-to-unfollow,
+    })
+    (ok true)
+  )
+)
+
+;; REWARD DISTRIBUTION SYSTEM
+
+;; Claim earned rewards for quality content
+(define-public (claim-content-rewards (content-id uint))
+  (let (
+      (content-data (unwrap! (map-get? content content-id) err-not-found))
+      (creator (get creator content-data))
+    )
+    (asserts! (is-eq tx-sender creator) err-unauthorized)
+    (asserts! (not (get reward-claimed content-data)) err-unauthorized)
+    (asserts! (validate-content-id content-id) err-invalid-input)
+    (distribute-content-rewards content-id)
+  )
+)
+
+;; Add funds to the platform reward pool
+(define-public (add-to-reward-pool (amount uint))
+  (begin
+    (asserts! (validate-amount amount) err-invalid-input)
+    (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+    (var-set content-reward-pool (+ (var-get content-reward-pool) amount))
+    (ok amount)
+  )
+)
+
+;; ADMINISTRATIVE FUNCTIONS
+
+;; Toggle contract operational status
+(define-public (set-contract-enabled (enabled bool))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (var-set contract-enabled enabled)
+    (ok enabled)
+  )
+)
+
+;; Update minimum stake requirement
+(define-public (set-min-stake-amount (amount uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (validate-amount amount) err-invalid-input)
+    (var-set min-stake-amount amount)
+    (ok amount)
+  )
+)
+
+;; Manually verify trusted users
+(define-public (verify-user (user principal))
+  (let ((user-data (unwrap! (map-get? users user) err-not-found)))
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (validate-user user) err-invalid-input)
+    (map-set users user (merge user-data { verified: true }))
+    (unwrap! (update-reputation user 100 "verification") err-owner-only)
+    (ok true)
+  )
+)
+
+;; Emergency fund withdrawal for contract owner
+(define-public (emergency-withdraw (amount uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (validate-amount amount) err-invalid-input)
+    (try! (as-contract (stx-transfer? amount tx-sender contract-owner)))
+    (ok amount)
+  )
+)
